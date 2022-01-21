@@ -1,0 +1,25 @@
+[package]
+name = "grpcio-demo"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+grpcio = { version = "0.9", default-features = false, features = ["prost-codec"] }
+lazy_static = "1"
+protobuf = "2.8"
+prost = "0.7"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+mimalloc = { version = "0.1", default-features = false }
+
+
+[build-dependencies]
+# protobuf-build = { version = "0.12", features = ["grpcio-protobuf-codec"] }
+protobuf-build = { version = "0.12", default-features = false, features = ["grpcio-prost-codec"] }
+
+[profile.release]
+codegen-units = 1
+debug = true
+lto = true

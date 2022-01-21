@@ -1,0 +1,408 @@
+syntax = "proto3";
+package tikvpb;
+
+// Key/value store API for TiKV.
+service Tikv {
+    // Commands using a transactional interface.
+    rpc KvGet(GetRequest) returns (GetResponse) {}
+}
+
+// A transactional get command. Lookup a value for `key` in the transaction with
+// starting timestamp = `version`.
+message GetRequest {
+    Context context = 1;
+    bytes key = 2;
+    uint64 version = 3;
+}
+
+message GetResponse {
+    // A region error indicates that the request was sent to the wrong TiKV node
+    // (or other, similar errors).
+    Error region_error = 1;
+    // A value could not be retrieved due to the state of the database for the requested key.
+    KeyError error = 2;
+    // A successful result.
+    bytes value = 3;
+    // True if the key does not exist in the database.
+    bool not_found = 4;
+    reserved 5;
+    // Time and scan details when processing the request.
+    ExecDetailsV2 exec_details_v2 = 6;
+}
+
+// Helper messages.
+
+// Miscellaneous metadata attached to most requests.
+message Context {
+    reserved 4;
+    reserved "read_quorum";
+    uint64 region_id = 1;
+    RegionEpoch region_epoch = 2;
+    Peer peer = 3;
+    uint64 term = 5;
+    CommandPri priority = 6;
+    IsolationLevel isolation_level = 7;
+    bool not_fill_cache = 8;
+    bool sync_log = 9;
+
+    // True means execution time statistics should be recorded and returned.
+    bool record_time_stat = 10;
+    // True means RocksDB scan statistics should be recorded and returned.
+    bool record_scan_stat = 11;
+
+    bool replica_read = 12;
+    repeated uint64 resolved_locks = 13;
+    uint64 max_execution_duration_ms = 14;
+
+    // After a region applies to `applied_index`, we can get a
+    // snapshot for the region even if the peer is a follower.
+    uint64 applied_index = 15;
+    // A hint for TiKV to schedule tasks more fairly. Query with same task ID
+    // may share same priority and resource quota.
+    uint64 task_id = 16;
+
+    // Not required to read the most up-to-date data, replicas with `safe_ts` >= `start_ts`
+    // can handle read request directly
+    bool stale_read = 17;
+
+    // Any additional serialized information about the request.
+    bytes resource_group_tag = 18;
+}
+
+message LockInfo {
+    bytes primary_lock = 1;
+    uint64 lock_version = 2;
+    bytes key = 3;
+    uint64 lock_ttl = 4;
+    // How many keys this transaction involves in this region.
+    uint64 txn_size = 5;
+    Op lock_type = 6;
+    uint64 lock_for_update_ts = 7;
+    // Fields for transactions that are using Async Commit.
+    bool use_async_commit = 8;
+    uint64 min_commit_ts = 9;
+    repeated bytes secondaries = 10;
+}
+
+message KeyError {
+    LockInfo locked = 1; // Client should backoff or cleanup the lock then retry.
+    string retryable = 2; // Client may restart the txn. e.g write conflict.
+    string abort = 3; // Client should abort the txn.
+    WriteConflict conflict = 4; // Write conflict is moved from retryable to here.
+    AlreadyExist already_exist = 5; // Key already exists
+    Deadlock deadlock = 6; // Deadlock is used in pessimistic transaction for single statement rollback.
+    CommitTsExpired commit_ts_expired = 7; // Commit ts is earlier than min commit ts of a transaction.
+    TxnNotFound txn_not_found = 8; // Txn not found when checking txn status.
+    CommitTsTooLarge commit_ts_too_large = 9; // Calculated commit TS exceeds the limit given by the user.
+}
+
+message WriteConflict {
+    uint64 start_ts = 1;
+    uint64 conflict_ts = 2;
+    bytes key = 3;
+    bytes primary = 4;
+    uint64 conflict_commit_ts = 5;
+}
+
+message AlreadyExist {
+    bytes key = 1;
+}
+
+message Deadlock {
+    uint64 lock_ts = 1;
+    bytes lock_key = 2;
+    uint64 deadlock_key_hash = 3;
+    repeated WaitForEntry wait_chain = 4;
+}
+
+message WaitForEntry {
+	// The transaction id that is waiting.
+	uint64 txn = 1;
+	// The transaction id that is being waited for.
+	uint64 wait_for_txn = 2;
+	// The hash value of the key is being waited for.
+	uint64 key_hash = 3;
+	// The key the current txn is trying to lock.
+	bytes key = 4;
+	// The tag came from the lock request's context.
+	bytes resource_group_tag = 5;
+	// Milliseconds it has been waits.
+	uint64 wait_time = 6;
+}
+
+
+message CommitTsExpired {
+    uint64 start_ts = 1;
+    uint64 attempted_commit_ts = 2;
+    bytes key = 3;
+    uint64 min_commit_ts = 4;
+}
+
+message TxnNotFound {
+    uint64 start_ts = 1;
+    bytes primary_key = 2;
+}
+
+message CommitTsTooLarge {
+    uint64 commit_ts = 1; // The calculated commit TS.
+}
+
+enum CommandPri {
+    Normal = 0; // Normal is the default value.
+    Low = 1;
+    High = 2;
+}
+
+enum IsolationLevel {
+    SI = 0; // SI = snapshot isolation
+    RC = 1; // RC = read committed
+}
+
+message TimeDetail {
+    // Off-cpu wall time elapsed in TiKV side. Usually this includes queue waiting time and
+    // other kind of waitings in series.
+    int64 wait_wall_time_ms = 1;
+    // Off-cpu and on-cpu wall time elapsed to actually process the request payload. It does not
+    // include `wait_wall_time`.
+    // This field is very close to the CPU time in most cases. Some wait time spend in RocksDB
+    // cannot be excluded for now, like Mutex wait time, which is included in this field, so that
+    // this field is called wall time instead of CPU time.
+    int64 process_wall_time_ms = 2;
+    // KV read wall Time means the time used in key/value scan and get.
+    int64 kv_read_wall_time_ms = 3;
+}
+
+message ScanDetailV2 {
+    // Number of user keys scanned from the storage.
+    // It does not include deleted version or RocksDB tombstone keys.
+    // For Coprocessor requests, it includes keys that has been filtered out by
+    // Selection.
+    uint64 processed_versions = 1;
+
+    // Number of bytes of user key-value pairs scanned from the storage, i.e.
+    // total size of data returned from MVCC layer.
+    uint64 processed_versions_size = 8;
+
+    // Approximate number of MVCC keys meet during scanning. It includes
+    // deleted versions, but does not include RocksDB tombstone keys.
+    //
+    // When this field is notably larger than `processed_versions`, it means
+    // there are a lot of deleted MVCC keys.
+    uint64 total_versions = 2;
+
+    // Total number of deletes and single deletes skipped over during
+    // iteration, i.e. how many RocksDB tombstones are skipped.
+    uint64 rocksdb_delete_skipped_count = 3;
+
+    // Total number of internal keys skipped over during iteration.
+    // See https://github.com/facebook/rocksdb/blob/9f1c84ca471d8b1ad7be9f3eebfc2c7e07dfd7a7/include/rocksdb/perf_context.h#L84 for details.
+    uint64 rocksdb_key_skipped_count = 4;
+
+    // Total number of RocksDB block cache hits.
+    uint64 rocksdb_block_cache_hit_count = 5;
+
+    // Total number of block reads (with IO).
+    uint64 rocksdb_block_read_count = 6;
+
+    // Total number of bytes from block reads.
+    uint64 rocksdb_block_read_byte = 7;
+}
+
+message ExecDetailsV2 {
+    // Available when ctx.record_time_stat = true or meet slow query.
+    TimeDetail time_detail = 1;
+
+    // Available when ctx.record_scan_stat = true or meet slow query.
+    ScanDetailV2 scan_detail_v2 = 2;
+}
+
+enum Op {
+    Put = 0;
+    Del = 1;
+    Lock = 2;
+    Rollback = 3;
+    // insert operation has a constraint that key should not exist before.
+    Insert = 4;
+    PessimisticLock = 5;
+    CheckNotExists = 6;
+}
+
+// Error wraps all region errors, indicates an error encountered by a request.
+message Error {
+    reserved "stale_epoch";
+
+    // The error message
+    string message = 1;
+    NotLeader not_leader = 2;
+    RegionNotFound region_not_found = 3;
+    KeyNotInRegion key_not_in_region = 4;
+    EpochNotMatch epoch_not_match = 5;
+    ServerIsBusy server_is_busy = 6;
+    StaleCommand stale_command = 7;
+    StoreNotMatch store_not_match = 8;
+    RaftEntryTooLarge raft_entry_too_large = 9;
+    MaxTimestampNotSynced max_timestamp_not_synced = 10;
+    ReadIndexNotReady read_index_not_ready = 11;
+    ProposalInMergingMode proposal_in_merging_mode = 12;
+    DataIsNotReady data_is_not_ready = 13;
+    RegionNotInitialized region_not_initialized = 14;
+}
+
+// NotLeader is the error variant that tells a request be handle by raft leader 
+// is sent to raft follower or learner.
+message NotLeader {
+    // The requested region ID
+    uint64 region_id = 1;
+    // Region leader of the requested region
+    Peer leader = 2;
+}
+
+// StoreNotMatch is the error variant that tells the request is sent to wrong store. 
+// (i.e. inconsistency of the store ID that request shows and the real store ID of this server.)
+message StoreNotMatch {
+    // Store id in request
+    uint64 request_store_id = 1;
+    // Actual store id
+    uint64 actual_store_id = 2;
+}
+
+// RegionNotFound is the error variant that tells there isn't any region in this TiKV
+// matches the requested region ID.
+message RegionNotFound {
+    // The requested region ID
+    uint64 region_id = 1;
+}
+
+// RegionNotInitialized is the error variant that tells there isn't any initialized peer
+// matchesthe request region ID.
+message RegionNotInitialized  {
+    // The request region ID
+    uint64 region_id = 1;
+}
+
+// KeyNotInRegion is the error variant that tells the key the request requires isn't present in
+// this region. 
+message KeyNotInRegion {
+    // The requested key
+    bytes key = 1;
+    // The requested region ID
+    uint64 region_id = 2;
+    // Start key of the requested region
+    bytes start_key = 3;
+    // Snd key of the requested region
+    bytes end_key = 4;
+}
+
+// EpochNotMatch is the error variant that tells a region has been updated.
+// (e.g. by splitting / merging, or raft Confchange.)
+// Hence, a command is based on a stale version of a region.
+message EpochNotMatch {
+    // Available regions that may be siblings of the requested one.
+    repeated Region current_regions = 1;
+}
+
+// ServerIsBusy is the error variant that tells the server is too busy to response.
+message ServerIsBusy {
+    string reason = 1;
+    // The suggested backoff time
+    uint64 backoff_ms = 2;
+}
+
+// StaleCommand is the error variant that tells the command is stale, that is,
+// the current request term is lower than current raft term.
+// This can be retried at most time.
+message StaleCommand {
+}
+
+// RaftEntryTooLarge is the error variant that tells the request is too large to be serialized to a
+// reasonable small raft entry.
+// (i.e. greater than the configured value `raft_entry_max_size` in `raftstore`)
+message RaftEntryTooLarge {
+    // The requested region ID
+    uint64 region_id = 1;
+    // Size of the raft entry
+    uint64 entry_size = 2;
+}
+
+// MaxTimestampNotSynced is the error variant that tells the peer has just become a leader and
+// updating the max timestamp in the concurrency manager from PD TSO is ongoing. In this case,
+// the prewrite of an async commit transaction cannot succeed. The client can backoff and
+// resend the request.
+message MaxTimestampNotSynced {
+}
+
+// ReadIndexNotReady is the error variant that tells the read index request is not ready, that is,
+// the current region is in a status that not ready to serve the read index request. For example,
+// region is in splitting or merging status.
+// This can be retried at most time.
+message ReadIndexNotReady {
+    // The reason why the region is not ready to serve read index request
+    string reason = 1;
+    // The requested region ID
+    uint64 region_id = 2;
+}
+
+// ProposalInMergingMode is the error variant that tells the proposal is rejected because raft is
+// in the merging mode. This may happen when BR/Lightning try to ingest SST.
+// This can be retried at most time.
+message ProposalInMergingMode {
+    // The requested region ID
+    uint64 region_id = 1;
+}
+
+message DataIsNotReady {
+    // The requested region ID
+    uint64 region_id = 1;
+    uint64 peer_id = 2;
+    uint64 safe_ts = 3;
+}
+
+message Region {
+    uint64 id = 1;
+    // Region key range [start_key, end_key).
+    bytes start_key = 2;
+    bytes end_key = 3;
+    RegionEpoch region_epoch = 4;
+    repeated Peer peers = 5;
+    // Encryption metadata for start_key and end_key. encryption_meta.iv is IV for start_key.
+    // IV for end_key is calculated from (encryption_meta.iv + len(start_key)).
+    // The field is only used by PD and should be ignored otherwise.
+    // If encryption_meta is empty (i.e. nil), it means start_key and end_key are unencrypted.
+    EncryptionMeta encryption_meta = 6;
+}
+
+message RegionEpoch {
+    // Conf change version, auto increment when add or remove peer
+    uint64 conf_ver = 1;
+    // Region version, auto increment when split or merge
+    uint64 version = 2;
+}
+
+enum PeerRole {
+    // Voter -> Voter
+    Voter = 0;
+    // Learner/None -> Learner
+    Learner = 1;
+    // Learner/None -> Voter
+    IncomingVoter = 2;
+    // Voter -> Learner
+    DemotingVoter = 3;
+    // We forbid Voter -> None, it can introduce unavailability as discussed in
+    // etcd-io/etcd#7625
+    // Learner -> None can be apply directly, doesn't need to be stored as
+    // joint state.
+}
+
+message Peer {
+    uint64 id = 1;
+    uint64 store_id = 2;
+    PeerRole role = 3;
+}
+
+// General encryption metadata for any data type.
+message EncryptionMeta {
+    // ID of the key used to encrypt the data.
+    uint64 key_id = 1;
+    // Initialization vector (IV) of the data.
+    bytes iv = 2;
+}
